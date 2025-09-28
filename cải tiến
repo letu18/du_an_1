@@ -1,0 +1,238 @@
+import sys
+import time
+import signal
+from pyspark.sql.functions import regexp_extract, from_json, col, to_date, lag, lead, avg, count, sum, max, min, when, lit, distinct
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+import logging
+import os
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, DoubleType, LongType,
+    TimestampType, DateType   
+)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s:%(funcName)s:%(levelname)s:%(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    filename='oke.log',
+                    filemode='a',
+                    encoding='utf-8'
+)
+logger = logging.getLogger()
+from dotenv import load_dotenv
+load_dotenv()
+
+# Xử lý tín hiệu để thoát an toàn
+def signal_handler(sig, frame):
+    logging.info("Stopping streaming application...")
+    if 'query' in globals() and query is not None:
+        query.stop()
+    logging.info("Application stopped")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def create_spark_session():
+    try:
+        # Lấy biến từ .env
+        app_name = os.getenv("APP_NAME")
+        cassandra_host = os.getenv("CASSANDRA_HOST")
+        cassandra_port = os.getenv("CASSANDRA_PORT")
+        cassandra_user = os.getenv("CASSANDRA_USER")
+        cassandra_password = os.getenv("CASSANDRA_PASSWORD")
+        cassandra_version = os.getenv("CASSANDRA_CONNECTOR_VERSION")
+        kafka_version = os.getenv("KAFKA_CONNECTOR_VERSION")
+        scala_version = os.getenv("SCALA_VERSION")
+
+        # Ghép chuỗi jar
+        jars = ",".join([
+            f"com.datastax.spark:spark-cassandra-connector_{scala_version}:{cassandra_version}",
+            f"org.apache.spark:spark-sql-kafka-0-10_{scala_version}:{kafka_version}"
+        ])
+
+        # Tạo SparkSession với cấu hình tối ưu
+        spark = SparkSession.builder \
+            .appName(app_name) \
+            .config("spark.jars.packages", jars) \
+            .config("spark.cassandra.connection.host", cassandra_host) \
+            .config("spark.cassandra.connection.port", cassandra_port) \
+            .config("spark.cassandra.auth.username", cassandra_user) \
+            .config("spark.cassandra.auth.password", cassandra_password) \
+            .config("spark.sql.shuffle.partitions", "200") \
+            .config("spark.executor.memory", "2g") \
+            .config("spark.executor.cores", "2") \
+            .config("spark.dynamicAllocation.enabled", "true") \
+            .config("spark.cassandra.output.batch.size.rows", "100") \
+            .config("spark.cassandra.connection.connections_per_executor_max", "10") \
+            .getOrCreate()
+
+        spark.sparkContext.setLogLevel("INFO")
+        logging.info("Spark session created successfully.")
+        return spark
+
+    except Exception as e:
+        logging.error(f"Couldn't create Spark session: {e}", exc_info=True)
+        return None
+
+def create_initial_dataframe(spark_session):
+    try:
+        kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+        kafka_topic = os.getenv("KAFKA_TOPIC")
+
+        # Định nghĩa schema cho JSON
+        schema = StructType([
+            StructField("Ngay", StringType(), True),
+            StructField("GiaDieuChinh", StringType(), True),
+            StructField("GiaDongCua", StringType(), True),
+            StructField("ThayDoi", StringType(), True),
+            StructField("KhoiLuongKhopLenh", StringType(), True),
+            StructField("GiaTriKhopLenh", StringType(), True),
+            StructField("KLThoaThuan", StringType(), True),
+            StructField("GtThoaThuan", StringType(), True),
+            StructField("GiaMoCua", StringType(), True),
+            StructField("GiaCaoNhat", StringType(), True),
+            StructField("GiaThapNhat", StringType(), True),
+            StructField("code", StringType(), True)
+        ])
+
+        # Đọc Kafka
+        df = (spark_session.readStream
+            .format("kafka")
+            .option("kafka.bootstrap.servers", kafka_bootstrap_servers)
+            .option("subscribe", kafka_topic)
+            .option("startingOffsets", "earliest")
+            .option("failOnDataLoss", "false")  # Không lỗi khi mất dữ liệu
+            .load())
+
+        # Parse JSON
+        df = df.selectExpr("CAST(value AS STRING) as raw") \
+               .withColumn("jsonData", from_json(col("raw"), schema)) \
+               .select("jsonData.*")
+
+        # Chuyển đổi kiểu dữ liệu
+        df = df.withColumn("ngay", to_date(col("Ngay"), "dd/MM/yyyy")) \
+               .withColumn("giadieuchinh", col("GiaDieuChinh").cast("double")) \
+               .withColumn("giadongcua", col("GiaDongCua").cast("double")) \
+               .withColumn("khoiluongkhoplenh", col("KhoiLuongKhopLenh").cast("long")) \
+               .withColumn("giatrikhoplenh", col("GiaTriKhopLenh").cast("double")) \
+               .withColumn("klthoathuan", col("KLThoaThuan").cast("long")) \
+               .withColumn("gtthoathuan", col("GtThoaThuan").cast("double")) \
+               .withColumn("giamocua", col("GiaMoCua").cast("double")) \
+               .withColumn("giacaonhat", col("GiaCaoNhat").cast("double")) \
+               .withColumn("giathapnhat", col("GiaThapNhat").cast("double")) \
+               .withColumn("thaydoi_value", regexp_extract(col("ThayDoi"), r"([0-9.-]+)", 1).cast("double")) \
+               .withColumn("thaydoi_percent", regexp_extract(col("ThayDoi"), r"\(([0-9.-]+)\s*%\)", 1).cast("double")) \
+               .withColumn("code", col("code"))
+
+        # Thêm watermarking để xử lý dữ liệu đến muộn
+        df = df.withWatermark("ngay", "1 day")
+
+        # Kiểm tra tính hợp lệ của dữ liệu
+        df = df.withColumn("is_valid_price", 
+                          (col("giadongcua") > 0) & 
+                          (col("giacaonhat") >= col("giadongcua")) & 
+                          (col("giathapnhat") <= col("giadongcua")))
+
+        # Đánh dấu các bản ghi không hợp lệ
+        df = df.withColumn("data_quality_flag", 
+                          when(col("is_valid_price"), "VALID").otherwise("INVALID_PRICE"))
+
+        # Thêm các chỉ số phân tích
+        windowSpec = Window.partitionBy("code").orderBy("ngay")
+        df = df.withColumn("prev_close", lag("giadongcua", 1).over(windowSpec)) \
+               .withColumn("price_change", col("giadongcua") - col("prev_close")) \
+               .withColumn("avg_5day", avg("giadongcua").over(windowSpec.rowsBetween(-4, 0)))
+
+        # Lọc key
+        df = df.filter(col("code").isNotNull() & col("ngay").isNotNull())
+        df = df.dropDuplicates(["code", "ngay"])
+
+        df.printSchema()
+        logging.info("Initial streaming DataFrame schema created successfully (JSON).")
+        return df
+
+    except Exception as e:
+        logging.error(f"Couldn't create initial DataFrame: {e}", exc_info=True)
+        return None
+
+# Hàm để tính toán và ghi log metrics
+def log_batch_metrics(batch_df, batch_id):
+    try:
+        count_records = batch_df.count()
+        if count_records > 0:
+            # Tính toán các metrics
+            metrics = batch_df.agg(
+                count("*").alias("record_count"),
+                max("ngay").alias("latest_date"),
+                min("ngay").alias("earliest_date"),
+                count(distinct("code")).alias("unique_codes")
+            ).collect()[0]
+            
+            logging.info(f"Batch {batch_id}: Processed {metrics['record_count']} records " +
+                        f"from {metrics['earliest_date']} to {metrics['latest_date']} " +
+                        f"for {metrics['unique_codes']} unique stock codes")
+    except Exception as e:
+        logging.error(f"Error calculating batch metrics: {e}")
+
+# Hàm xử lý mỗi batch
+def process_batch(batch_df, batch_id):
+    try:
+        # Log metrics
+        log_batch_metrics(batch_df, batch_id)
+        
+        # Ghi vào Cassandra
+        batch_df.write \
+            .format("org.apache.spark.sql.cassandra") \
+            .option("keyspace", "spark_streaming") \
+            .option("table", "csdl_anhlap") \
+            .mode("append") \
+            .save()
+            
+        logging.info(f"Successfully wrote batch {batch_id} to Cassandra")
+    except Exception as e:
+        logging.error(f"Error processing batch {batch_id}: {e}", exc_info=True)
+
+def start_streaming(df):
+    try:
+        # Sử dụng foreachBatch để xử lý từng batch
+        query = (df.writeStream
+            .foreachBatch(process_batch)
+            .outputMode("append")
+            .option("checkpointLocation", "/tmp/spark_checkpoints/csdl_anhlap")
+            .trigger(processingTime='1 minute')  # Xử lý mỗi phút
+            .start())
+        
+        logging.info("Streaming query started and writing to Cassandra.")
+        
+        # Kiểm tra trạng thái query
+        while query.isActive:
+            if query.exception():
+                logging.error(f"Query exception: {query.exception()}")
+                # Có thể thêm logic tái khởi động ở đây
+                break
+            time.sleep(10)  # Kiểm tra mỗi 10 giây
+            
+        return query.awaitTermination()
+    except Exception as e:
+        logging.error(f"Streaming failed: {e}", exc_info=True)
+        # Thử kết nối lại sau một thời gian
+        time.sleep(30)
+        logging.info("Attempting to restart streaming...")
+        return start_streaming(df)
+
+def write_streaming_data():
+    spark = create_spark_session()
+    if spark is None:
+        logging.error("Failed to create Spark session. Exiting.")
+        return
+        
+    df = create_initial_dataframe(spark)
+    if df is None:
+        logging.error("Failed to create initial DataFrame. Exiting.")
+        return
+        
+    start_streaming(df)
+
+if __name__ == '__main__':
+    write_streaming_data()
